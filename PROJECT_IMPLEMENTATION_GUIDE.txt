@@ -1,0 +1,624 @@
+==============================================================================
+ SMART PARKING MANAGEMENT SYSTEM
+ INDUSTRY-LEVEL IMPLEMENTATION GUIDE (STEP BY STEP)
+==============================================================================
+
+This document explains how this project is built from scratch, following the
+same process used in professional software teams — only smaller. Read it from
+top to bottom and you can rebuild the entire system yourself.
+
+
+==============================================================================
+ PART 1 — HOW INDUSTRY PROJECTS START (SDLC)
+==============================================================================
+
+Every real project follows the Software Development Life Cycle:
+
+  1. REQUIREMENTS      What must the system do?
+  2. ANALYSIS          What are the entities and rules?
+  3. DESIGN            What classes/interfaces? How do they talk?
+  4. IMPLEMENTATION    Write the code in dependency order.
+  5. TESTING           Prove each piece works; fix defects.
+  6. DEPLOYMENT        Package and run it for the user.
+  7. MAINTENANCE       Extend, refactor, add features.
+
+This project walks through all seven.
+
+
+------------------------------------------------------------------------------
+ STEP 1 — REQUIREMENTS GATHERING
+------------------------------------------------------------------------------
+
+Functional requirements (what the system DOES):
+
+  FR1  Park a vehicle: validate it, assign a compatible free slot, issue a
+       unique ticket with entry time.
+  FR2  Remove a vehicle: show who / what / where / how long for a ticket.
+  FR3  Find a vehicle by registration number (exact) with a type-based
+       fallback search (partial match).
+  FR4  Show free slot counts per vehicle type + the full slot board.
+  FR5  List all currently parked vehicles with live duration.
+  FR6  Calculate parking fee: duration, grace period, rate plan, total.
+  FR7  Take payment (Cash / Card / UPI), close the ticket, free the slot.
+  FR8  Exit the application cleanly.
+
+Non-functional requirements (how WELL it works):
+
+  NFR1 Pure Core Java — no database, no framework, no GUI.
+  NFR2 Console-based menu interaction via Scanner.
+  NFR3 Valid input only: reject bad registration numbers, empty names,
+       duplicate parking, wrong vehicle type for a slot, full lot, and
+       unknown tickets — as readable messages, never stack traces.
+  NFR4 Business rules enforced:
+         - Bike Rs 20/hour, Car Rs 40/hour, Truck Rs 80/hour
+         - First 15 minutes are free (grace period)
+         - Remaining minutes round UP to the next full hour
+         - Capacity: 5 bike (B-01..B-05), 8 car (C-01..C-08),
+           3 large (L-01..L-03)
+  NFR5 A failed payment must NEVER free the slot or lose the vehicle.
+  NFR6 JDK 17+ (uses switch expressions, Duration, LocalDateTime).
+
+
+------------------------------------------------------------------------------
+ STEP 2 — DOMAIN ANALYSIS (find the nouns = your classes)
+------------------------------------------------------------------------------
+
+Read the requirements and underline every noun. That is how you discover
+classes in industry analysis:
+
+  vehicle        -> abstract class Vehicle (Bike / Car / Truck)
+  slot           -> class ParkingSlot
+  ticket         -> class ParkingTicket
+  parking lot    -> class ParkingLot
+  payment        -> interface Payment (Cash / Card / UPI)
+  bike/car/large -> enum SlotType
+  error          -> custom exceptions (ParkingException hierarchy)
+
+And every verb becomes a method:
+
+  park(vehicle)          findFreeSlot(vehicle)
+  release()              occupy(vehicle)
+  remove(ticketId, pay)  calculateFee()
+  pay(amount)            findVehicle(reg)
+
+
+------------------------------------------------------------------------------
+ STEP 3 — CLASS DESIGN (UML-style, done on paper BEFORE coding)
+------------------------------------------------------------------------------
+
+                    abstract Vehicle
+                    + registrationNumber
+                    + ownerName
+                    + hourlyRate
+                    + getVehicleType()   [abstract]
+                    + getRequiredSlot()  [abstract]
+                    ┌──────────┬─────────┬─────────┐
+                  Bike       Car      Truck      ...
+                 Rs20/h     Rs40/h    Rs80/h
+
+   interface Payment          ParkingSlot
+   + pay(double)              + slotId, type
+   + getMethodName()          - vehicle   (private!)
+   ┌───────┬────────┬─────┐   + occupy(), release(), isFree()
+ Cash   Card      UPI
+
+   ParkingTicket
+   - static lastTicketNumber  (id generation: T1001, T1002, ...)
+   + ticketId, vehicle, slot, entryTime, exitTime, amountDue
+   + calculateFee(), close(time), getDuration()
+
+   ParkingLot  (COMPOSITION — HAS-A, not IS-A)
+   + final BIKE_SLOTS=5, CAR_SLOTS=8, LARGE_SLOTS=3, GRACE=15
+   - List<ParkingSlot> slots
+   - Map<String, ParkingTicket> activeTickets
+   - Map<String, ParkingTicket> closedTickets
+   + park(), remove(), findVehicle(), getAvailableSlots(), ...
+
+Design rules agreed up front:
+
+  * Encapsulation  — ParkingSlot.vehicle is PRIVATE. Outside code calls
+                     occupy()/release(); the slot itself decides if the
+                     change is legal. No "setVehicle()" setter anywhere.
+  * Abstraction    — Vehicle is abstract; Payment is an interface. Callers
+                     depend on the abstraction, not the concrete class.
+  * Polymorphism   — calculateFee() never checks "instanceof Car". It asks
+                     vehicle.getHourlyRate() and the right value appears.
+  * Composition    — ParkingLot OWNS slots and tickets (created inside it).
+  * Open/Closed    — adding a new vehicle (Bus, EV) later requires ZERO
+                     changes to ParkingTicket, ParkingLot, or the menu.
+  * Fail-safe money— payment happens BEFORE the slot is released.
+
+
+------------------------------------------------------------------------------
+ STEP 4 — IMPLEMENTATION ORDER (dependency order, bottom-up)
+------------------------------------------------------------------------------
+
+Industry teams do not write code top-to-bottom. They write from the
+LEAF classes upward so every new class compiles against something real.
+
+------------------------------------------------------------------------------
+ 4.1  enum SlotType
+------------------------------------------------------------------------------
+   Why first: everything else references it.
+   - Fixed set of slot categories: BIKE("B","Bike"), CAR("C","Car"),
+     LARGE("L","Large").
+   - Encoded a code ("B") and label ("Car") as FINAL fields with getters.
+   - Enums beat int constants: the compiler catches mistakes, and you
+     can attach data + methods to each constant.
+
+   Result: slot IDs like "C-03" come from type.getCode() + "-" + number.
+
+------------------------------------------------------------------------------
+ 4.2  Custom exception hierarchy
+------------------------------------------------------------------------------
+   Why second: the domain vocabulary for errors must exist before logic.
+
+     Exception
+       └── ParkingException          (checked — forces the caller to handle)
+             ├── InvalidVehicleException
+             ├── ParkingFullException
+             └── InvalidTicketException
+
+   Rules applied:
+   * All extend a COMMON checked base (ParkingException). One catch block
+     in the UI layer handles the whole family.
+   * CHECKED exceptions for recoverable business errors the user can fix
+     (bad registration, lot full, wrong ticket). The console prints a
+     friendly message instead of a stack trace.
+   * Message quality is part of the API: "Registration number must be at
+     least 6 characters." not "ERROR 500".
+
+------------------------------------------------------------------------------
+ 4.3  abstract class Vehicle + subclasses Bike / Car / Truck
+------------------------------------------------------------------------------
+   - Private FINAL fields (registrationNumber, ownerName, hourlyRate):
+     set once in the constructor, never changed. True immutability.
+   - Constructor validation: the object is NEVER created in an invalid
+     state. new Car("MH","") throws before the Car exists. This is
+     "make illegal states unrepresentable".
+   - Normalisation: registration is trimmed and upper-cased ONCE so
+     "mh12ab1234 " and "MH12AB1234" behave identically later.
+   - Two abstract methods force every subclass to declare:
+       getVehicleType()  -> "Car" (display)
+       getRequiredSlot() -> SlotType.CAR (routing rule)
+   - Each subclass constructor hardcodes its own rate via super(...)
+     (Bike passes 20, Car 40, Truck 80). Rate lives in ONE place only.
+
+   OOP at work: Inheritance (IS-A Vehicle), Abstraction (abstract
+   methods), Encapsulation (private FINAL fields), Polymorphism (each
+   subclass answers abstract calls differently).
+
+------------------------------------------------------------------------------
+ 4.4  class ParkingSlot
+------------------------------------------------------------------------------
+   - Private vehicle field. isFree() == (vehicle == null).
+   - occupy(Vehicle) does TWO safety checks before mutating:
+       1. vehicle.getRequiredSlot() must equal this slot's type
+          (a truck can never sit in a bike slot),
+       2. the slot must actually be free.
+     Both failures throw InvalidVehicleException. State is never corrupted.
+   - release() simply nulls the vehicle — only reachable through the
+     controlled flow in ParkingLot.remove().
+   - toString() renders the slot board line, e.g.
+       "C-01 [Car] -> AVAILABLE"
+       "C-02 [Car] -> Car MH12AB1234"
+
+   OOP at work: Encapsulation (private field, behaviour-guarded
+   transitions instead of getters/setters).
+
+------------------------------------------------------------------------------
+ 4.5  class ParkingTicket
+------------------------------------------------------------------------------
+   - static int lastTicketNumber = 1000;  // shared by ALL instances
+     Constructor does ticketId = "T" + (++lastTicketNumber);
+     => T1001, T1002, T1003 ... no central service needed, no duplicates.
+   - Holds references: Vehicle + ParkingSlot (association), entry/exit
+     time, and the computed amountDue.
+   - getDuration(): Duration.between(entryTime, exitTime != null ?
+     exitTime : now). One method, works for open AND closed tickets.
+   - calculateFee() — the billing heart, and the proof of polymorphism:
+
+       minutes = duration - GRACE_PERIOD_MINUTES
+       if (minutes <= 0)  amountDue = 0
+       else hours = (minutes + 59) / 60   // integer round-up
+            amountDue = hours * vehicle.getHourlyRate()
+
+     NOTE: no "if (vehicle instanceof Car)" anywhere. The vehicle itself
+     supplies its rate. Add a Bus tomorrow — this method is untouched.
+   - close(LocalDateTime) stamps exitTime and finalises the fee.
+
+   OOP at work: static (shared ticket counter), Polymorphism (rate from
+   the runtime object), single-responsibility (the ticket knows how to
+   bill itself).
+
+------------------------------------------------------------------------------
+ 4.6  interface Payment + CashPayment / CardPayment / UPIPayment
+------------------------------------------------------------------------------
+   - Interface with exactly what the lot needs:
+       boolean pay(double amount)   // false = declined
+       String  getMethodName()
+   - CashPayment: prints "Collected Rs N in cash.", returns true.
+   - CardPayment: stores cardHolder, prints a swipe confirmation.
+   - UPIPayment:  stores upiId, prints a payment request.
+   - Because pay() returns a boolean, a declined payment is DETECTABLE
+     — the lot reacts by refusing to release the slot (see 4.7).
+
+   OOP at work: Abstraction, Polymorphism, and the Open/Closed
+   principle — a new WalletPayment class needs no changes elsewhere.
+
+------------------------------------------------------------------------------
+ 4.7  class ParkingLot  (the orchestrator / service layer)
+------------------------------------------------------------------------------
+   - final constants define the lot's identity: BIKE_SLOTS=5,
+     CAR_SLOTS=8, LARGE_SLOTS=3, GRACE_PERIOD_MINUTES=15. Fixed rules
+     cannot be accidentally mutated.
+   - Composition: the constructor builds its own slots via addSlots().
+     The lot OWNS the slots; nothing outside can touch the list.
+   - Storage: LinkedHashMap (not HashMap) so tickets come out in
+     insertion order — cleaner console output and predictable logs.
+
+   park(Vehicle) — the check-out counter:
+     1. reject null vehicle
+     2. reject if this registration is ALREADY parked (no duplicates)
+     3. findFreeSlot(vehicle): first free slot whose type matches
+        vehicle.getRequiredSlot()   (polymorphic again)
+     4. slot.occupy(vehicle) — the slot re-validates
+     5. create ParkingTicket, store in activeTickets, return it
+     Any failure throws a ParkingException subclass upward.
+
+   remove(String ticketId, Payment payment) — the fail-safe exit:
+     1. getActiveTicket(ticketId) — throws InvalidTicketException if
+        the ID is unknown (normalised to upper case first)
+     2. reject null payment
+     3. double fee = ticket.calculateFee()
+     4. if (!payment.pay(fee)) throw ParkingException("Payment
+        declined by ...")  --> METHOD ENDS HERE, SLOT STILL OCCUPIED
+     5. only after successful payment:
+          ticket.close(now); ticket.getSlot().release();
+          move ticket from activeTickets to closedTickets
+     This ordering is a deliberate design decision: money first,
+     space second. A declined card never "eats" the car.
+
+   findVehicle(...) — method overloading:
+     findVehicle(String reg)              -> exact match, single ticket
+     findVehicle(String reg, SlotType t)  -> partial (contains) match,
+                                             returns a List
+   Plus getAvailableSlots(), getAvailableCount(type),
+   getActiveTickets(), getClosedTickets() as read-only views.
+
+   OOP at work: Composition, Overloading, Encapsulation (internal maps
+   are private; callers get copies of the values).
+
+
+------------------------------------------------------------------------------
+ 4.8  class Smart_Parking_Management_System (presentation layer)
+------------------------------------------------------------------------------
+   The LAST piece written, because it only depends on classes that
+   already exist. Separation of concerns: this class handles ONLY
+   console I/O. All business rules live in ParkingLot / ParkingTicket /
+   Vehicle. You could delete the menu and add a GUI tomorrow — the
+   domain classes would not change. That is the industry "layered"
+   approach:
+
+       [UI / Console]  ->  [ParkingLot service]  ->  [Ticket / Slot / Vehicle]
+
+   Contents:
+   - main(): entry point. Creates the app object, shows the banner,
+     starts run(). (Non-static main calling instance methods = easier
+     to test and to extend later.)
+   - run(): while(running) loop with printMenu() and a switch
+     EXPRESSION (Java 14+) mapping 1..8 to private handler methods.
+   - One private method per menu action: parkVehicle(), removeVehicle(),
+     findVehicle(), viewAvailableSlots(), viewParkedVehicles(),
+     calculateFee(), makePayment(). Each is a thin adapter: read input
+     -> call domain -> print result.
+   - Uniform error handling: every action wraps domain calls in
+     try { ... } catch (ParkingException e) { print "friendly prefix: "
+     + e.getMessage() }. The user never sees a stack trace.
+   - Input helpers: readText() trims input and exits gracefully on EOF;
+     readInt() loops until a valid integer arrives (defends against
+     "abc" crashing the app). format() applies the dd-MM-yyyy HH:mm
+     DateTimeFormatter everywhere for consistent timestamps.
+   - findVehicle() UX: exact search first; on miss, offers a type-based
+     partial search (the overloaded method from 4.7).
+
+
+==============================================================================
+ PART 2 — KEY INDUSTRY PRACTICES VISIBLE IN THIS CODEBASE
+==============================================================================
+
+  1. Single Responsibility
+     Vehicle knows its rate. Ticket knows billing. Slot knows its own
+     occupancy. Lot knows orchestration. UI knows printing. No class
+     does another's job.
+
+  2. Programming to an interface
+     The lot accepts any Payment. Cash/Card/UPI are interchangeable
+     strategies (Strategy pattern in embryo).
+
+  3. Fail-fast validation
+     Constructors validate. occupy() validates. park() validates.
+     Invalid objects never enter the system.
+
+  4. Defensive normalisation
+     Registration numbers and ticket IDs are trimmed + upper-cased at
+     the boundary, so internal comparisons are always reliable.
+
+  5. Immutability where possible
+     registrationNumber, ownerName, hourlyRate, slotId, ticketId,
+     entryTime are all final and set once.
+
+  6. Clean error taxonomy
+     One checked base exception, three specific children, human-
+     readable messages — catch once at the edge, handle cleanly.
+
+  7. Invariants over hope
+     "Payment before release" is ENFORCED by code order in remove(),
+     not by convention or a comment.
+
+  8. Predictable collections
+     LinkedHashMap keeps insertion order for stable console output.
+
+  9. No dead giveaways of future change
+     Zero instanceof in billing. Zero setters on private state. The
+     design survives adding vehicle types without modification.
+
+ 10. Documentation as deliverable
+     The header block and comments explain WHY, not WHAT. The README
+     is part of the product.
+
+
+==============================================================================
+ PART 3 — BUSINESS RULES CHEAT SHEET (verified against the code)
+==============================================================================
+
+  Rates            Bike 20, Car 40, Truck 80 (Rs / hour)
+  Grace period     First 15 minutes cost 0.
+  Rounding         (minutes + 59) / 60  -> any part of an hour counts
+                   as a full hour AFTER the grace window.
+  Free case        Total parked <= 15 min  =>  fee = 0.
+  Capacity         5 bike + 8 car + 3 large = 16 slots total.
+  Slot codes       B-01..B-05, C-01..C-08, L-01..L-03.
+  Ticket IDs       T1001, T1002, ... (static counter, process-wide).
+  Duplicate rule   Same registration cannot park twice simultaneously.
+  Type rule        A vehicle may only occupy its required SlotType.
+  Payment rule     Declined payment -> exception -> slot NOT released.
+  Exit rule        Only successful payment closes a ticket and frees
+                   the slot; closed tickets are archived in history.
+
+  Worked example:
+    Car parks 09:00, leaves 10:20.
+    Duration = 80 min. Grace 15 -> 65 billable.
+    Hours = (65 + 59) / 60 = 2. Fee = 2 * 40 = Rs 80.
+
+  Worked example (free):
+    Bike parks 11:00, leaves 11:15.
+    Duration = 15 min. Grace 15 -> 0 billable -> Rs 0.
+
+
+==============================================================================
+ PART 4 — HOW TO BUILD AND RUN (Windows PowerShell)
+==============================================================================
+
+  Requirements: JDK 17 or newer on PATH (check: java -version)
+
+  Compile:
+      javac -d out Smart_Parking_Management_System.java
+
+  Run:
+      java -cp out Smart_Parking_Management_System
+
+  Expected: the banner prints 16 slots / 15-minute grace, then the
+  8-item menu. Try option 1 -> Car -> any 6+ character registration
+  -> an owner name. You receive ticket T1001 and slot C-01.
+
+
+==============================================================================
+ PART 5 — TESTING (how a professional verifies this)
+==============================================================================
+
+  A. Manual smoke test script (run in this order):
+
+     T-01  Park a car -> expect success, slot C-01, ticket T1001.
+     T-02  Park the SAME registration again -> "already parked".
+     T-03  Park with a 5-character registration -> "must be at least
+           6 characters" (constructor rejection).
+     T-04  Park with empty owner -> "Owner name cannot be empty."
+     T-05  Find the vehicle by reg -> shows ticket + slot.
+     T-06  Find with a wrong reg -> offers type-based fallback search.
+     T-07  View available slots -> 4 bike, 7 car, 3 large.
+     T-08  View parked vehicles -> one row, live duration 00h 00m.
+     T-09  Calculate fee immediately -> Rs 0 (inside grace period).
+     T-10  Remove with a bogus ticket -> "Ticket T9999 does not
+           exist."
+     T-11  Make payment (Cash) -> receipt, slot C-01 free again.
+     T-12  Check option 4 -> car count back to 8.
+     T-13  Payment with invalid method number -> "Invalid payment
+           method." and vehicle stays parked.
+     T-14  Fill all 5 bike slots, park a 6th bike -> "No bike slot is
+           free right now."
+     T-15  Menu option 9 -> "Invalid option. Please choose 1 to 8."
+     T-16  Enter text at an integer prompt -> "Please enter a number."
+           (loop keeps asking, never crashes).
+
+  B. Unit-test candidates (if you later add JUnit):
+     - new Bike("AB12", "X") throws InvalidVehicleException.
+     - new Bike("AB1234", "X").getHourlyRate() == 20.
+     - slot.occupy(truck) on a CAR slot throws.
+     - occupy(); isFree() == false; occupy() again throws; release();
+       isFree() == true.
+     - ticket IDs increment: T1001 then T1002.
+     - calculateFee with duration 15m -> 0; 16m -> full-hour rate;
+       80m -> 2 hours worth (round-up proven).
+     - lot.park() twice with the same reg throws.
+     - remove() with a declining Payment (returns false) keeps the
+       ticket active and the slot occupied.
+     - remove() with an accepting Payment moves the ticket to closed.
+
+  C. Boundary values worth checking:
+     exactly 15:00 minutes (0 fee), 16 minutes (1 hour charged),
+     exactly 60 minutes, null inputs, lower-case registrations,
+     ticket IDs in lower case ("t1001" must still resolve).
+
+
+==============================================================================
+ PART 6 — VERSION CONTROL WORKFLOW (how the repo is managed)
+==============================================================================
+
+  - Git initialised in the project root; .gitignore excludes the
+    compiled "out/" directory and IDE files (.idea/) so only SOURCE
+    is tracked.
+  - Commit style for this kind of project:
+        feat: add payment flow with fail-safe slot release
+        fix: normalise ticket id lookup to upper case
+        docs: document billing rules in README
+  - Always commit with a message that says WHY, review with
+    git diff before committing, and never commit secrets (none here,
+    but that habit matters at work).
+
+
+==============================================================================
+ PART 7 — TAKING THIS TO TRUE INDUSTRY SCALE (roadmap)
+==============================================================================
+
+  The single-file structure is a LEARNING choice. In a real company,
+  the same design grows into:
+
+  Stage 1 — Multi-file, multi-package (still Core Java)
+
+      com.parking.model      Vehicle, Bike, Car, Truck, SlotType
+      com.parking.domain     ParkingSlot, ParkingTicket, ParkingLot
+      com.parking.payment    Payment, CashPayment, CardPayment, UPI
+      com.parking.exception  ParkingException, ...
+      com.parking.ui         ConsoleMenu (the current main class)
+      com.parking.util       InputReader, DateTimeFormatters
+      test/...               JUnit 5 tests mirroring the packages
+
+      Rules: no circular package dependencies; UI depends on domain,
+      never the reverse. javac compiles all of src into out/.
+
+  Stage 2 — Persistence
+      Replace the in-memory maps with a Repository interface:
+
+          interface TicketRepository {
+              void save(ParkingTicket t);
+              Optional<ParkingTicket> findById(String id);
+              List<ParkingTicket> findAllActive();
+          }
+
+      Implementations: InMemoryTicketRepository (today's maps) or
+      JdbcTicketRepository (SQLite/PostgreSQL). The ParkingLot code
+      does not change — that is the power of coding to an interface.
+
+  Stage 3 — Concurrency (a real lot has multiple entry gates)
+      - Replace LinkedHashMap with ConcurrentHashMap.
+      - Guard park()/remove() with synchronized or Lock, because
+        two attendants could grab the same free slot simultaneously.
+      - Better: make ParkingLot methods transactional —
+        "find slot + occupy + ticket" must be ATOMIC.
+
+  Stage 4 — Service + API layer (Spring Boot)
+      - @RestController exposing:
+          POST   /api/tickets          (park)
+          GET    /api/tickets/{id}     (find/remove preview)
+          POST   /api/tickets/{id}/pay (payment + release)
+          GET    /api/slots            (availability)
+      - DTOs instead of domain objects crossing the wire.
+      - Jakarta Bean Validation replacing manual constructor checks.
+      - Global @RestControllerAdvice mapping ParkingException to
+        HTTP 400/404/409 with a JSON error body.
+      - Spring DI injects the TicketRepository into ParkingLotService.
+
+  Stage 5 — Production hardening
+      - SLF4J + Logback logging (info for flows, warn for declines,
+        error for unexpected faults).
+      - Metrics: occupancy %, average stay duration, revenue/day.
+      - Front end: React/Thx frontend or JavaFX desktop client.
+      - Dockerfile + CI (GitHub Actions) running the test suite on
+        every push.
+      - Secrets/config via environment variables, never hard-coded.
+
+
+==============================================================================
+ PART 8 — DESIGN DECISION LOG (WHY the code looks like this)
+==============================================================================
+
+  D1  Single file with several classes instead of many files.
+      Reason: keeps the OOP structure visible for learning; zero
+      package/import noise while the concepts are new.
+
+  D2  Checked exceptions for domain errors.
+      Reason: the compiler forces callers to acknowledge failure
+      paths — ideal for a system where silent failure loses cars.
+
+  D3  Billing uses polymorphism, not instanceof.
+      Reason: Open/Closed. New vehicle types cost zero edits in the
+      billing, lot, or menu code.
+
+  D4  Payment executes BEFORE slot release.
+      Reason: an atomicity/consistency rule. Money failure must not
+      change parking state. Mirrors real POS behavior.
+
+  D5  Grace period + integer round-up implemented as (m+59)/60.
+      Reason: exact arithmetic, no floating point, no rounding bugs.
+
+  D6  Static ticket counter instead of a database sequence.
+      Reason: no persistence layer exists; a static field guarantees
+      uniqueness within the process with one line of code.
+
+  D7  LinkedHashMap for tickets.
+      Reason: insertion-ordered iteration makes console listings and
+      demos predictable.
+
+  D8  Normalisation (trim + upper-case) at construction / lookup.
+      Reason: one defensive boundary beats scattered equalsIgnoreCase
+      calls later.
+
+  D9  No setters on ParkingSlot.vehicle.
+      Reason: setters invite invalid states; occupy()/release() make
+      every transition explicit and validated.
+
+  D10 UI separated from domain logic.
+      Reason: testability and future GUI/API replacement without
+      touching business rules.
+
+
+==============================================================================
+ PART 9 — CHECKLIST: WHAT "DONE" LOOKS FOR EACH FEATURE
+==============================================================================
+
+  [ ] Requirement documented (README feature table)
+  [ ] Domain class(es) written with validation
+  [ ] Business rule enforced in code, not just comments
+  [ ] Failure path returns a typed exception with a clear message
+  [ ] Console handler catches it and prints a human message
+  [ ] Manual test cases executed (see Part 5)
+  [ ] Compiled with javac -d out ... and run without errors
+  [ ] Committed with a meaningful message
+
+  Every feature in this project passed this list before being called
+  finished. That discipline — not the size of the code — is what
+  separates student code from professional code.
+
+
+==============================================================================
+ PART 10 — LEARNING PATH (suggested order to study this repo)
+==============================================================================
+
+  1. Read the header comment block (top of the .java file).
+  2. Read SlotType + the exception hierarchy (small, sets vocabulary).
+  3. Read Vehicle and its three subclasses (inheritance + validation).
+  4. Read ParkingSlot (encapsulation pattern).
+  5. Read ParkingTicket — focus on calculateFee() and the static ID.
+  6. Read Payment interface + its three implementations.
+  7. Read ParkingLot.park() and remove() — the core flows.
+  8. Read the menu class last — it only wires everything together.
+  9. Run the app and exercise every menu option.
+  10. Break things on purpose: delete the payment-before-release
+      ordering, add an "instanceof" into calculateFee, then restore
+      them. Experiencing why each decision exists is the real lesson.
+
+==============================================================================
+ End of guide. Rebuild the project from Parts 1-4, verify with Part 5,
+ extend with Part 7. That is the full industry loop.
+==============================================================================
